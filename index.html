@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Approve">
+<meta name="theme-color" content="#111111">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<title>Claude Approve</title>
+<style>
+  :root { color-scheme: dark; --bg:#111; --card:#1c1c1e; --line:#2c2c2e; --text:#f2f2f7; --muted:#8e8e93; --ok:#30d158; --no:#ff453a; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.4 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+         padding: calc(env(safe-area-inset-top) + 20px) 16px calc(env(safe-area-inset-bottom) + 24px); -webkit-font-smoothing: antialiased; }
+  h1 { font-size:28px; margin:8px 4px 16px; letter-spacing:-0.02em; }
+  p { color:var(--muted); margin:8px 4px; }
+  .card { background:var(--card); border-radius:16px; padding:16px; margin:12px 0; }
+  .rule { font:600 17px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; word-break:break-all; }
+  .meta { color:var(--muted); font-size:14px; margin-top:8px; }
+  .row { display:flex; gap:10px; margin-top:14px; }
+  button { flex:1; border:0; border-radius:12px; padding:14px; font:600 17px -apple-system, system-ui, sans-serif; color:#fff; }
+  button:active { transform: scale(0.98); }
+  button[disabled] { opacity:.45; }
+  .approve { background:var(--ok); color:#002a0c; }
+  .reject { background:#3a3a3c; }
+  .primary { background:#0a84ff; width:100%; }
+  .status { margin-top:12px; font-weight:600; }
+  .done { opacity:.55; }
+  .code { font:700 30px ui-monospace, Menlo, monospace; letter-spacing:.04em; text-align:center; padding:14px 0; }
+  .empty { text-align:center; padding:40px 0; color:var(--muted); }
+  .foot { text-align:center; margin-top:28px; font-size:13px; color:var(--muted); }
+  .foot a { color:var(--muted); }
+  ol { color:var(--muted); padding-left:22px; } li { margin:8px 0; }
+  .hide { display:none; }
+  .flash { outline: 2px solid #0a84ff; }
+</style>
+</head>
+<body>
+<h1>Claude Approve</h1>
+
+<section id="v-install" class="hide">
+  <div class="card">
+    <p style="color:var(--text)">Add this to your Home Screen first. iPhone only sends notifications to apps on the Home Screen.</p>
+    <ol>
+      <li>Tap the Share button in Safari</li>
+      <li>Tap <b>Add to Home Screen</b>, then <b>Add</b></li>
+      <li>Open <b>Approve</b> from your Home Screen</li>
+    </ol>
+  </div>
+</section>
+
+<section id="v-setup" class="hide">
+  <div class="card">
+    <p style="color:var(--text)">Get a notification whenever Claude asks for a new permission, and approve it with one tap.</p>
+    <div class="row"><button class="primary" id="b-enable">Turn on notifications</button></div>
+    <div class="status" id="setup-msg"></div>
+  </div>
+</section>
+
+<section id="v-pair" class="hide">
+  <div class="card">
+    <p style="color:var(--text)">A box will pop up on your Mac. Click <b>Pair</b> if it shows this code:</p>
+    <div class="code" id="pair-code"></div>
+    <p id="pair-msg">Waiting for your Mac…</p>
+  </div>
+</section>
+
+<section id="v-main" class="hide">
+  <div id="list"></div>
+</section>
+
+<div class="foot" id="foot"></div>
+
+<script src="config.js"></script>
+<script src="db.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder();
+const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const unb64u = (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4)), (c) => c.charCodeAt(0));
+const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const standalone = navigator.standalone || matchMedia("(display-mode: standalone)").matches;
+
+function show(v) { for (const s of ["install", "setup", "pair", "main"]) $("v-" + s).classList.toggle("hide", s !== v); }
+
+async function post(msg) {
+  const r = await fetch("https://ntfy.sh/" + CONFIG.topic, { method: "POST", body: JSON.stringify(msg) });
+  if (!r.ok) throw new Error("send failed (" + r.status + ")");
+}
+
+async function pairCode(pubRaw) {
+  const h = new Uint8Array(await crypto.subtle.digest("SHA-256", pubRaw));
+  const hex = [...h.slice(0, 6)].map((b) => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+  return hex.slice(0, 4) + "-" + hex.slice(4, 8) + "-" + hex.slice(8, 12);
+}
+
+async function enable() {
+  const msg = $("setup-msg");
+  $("b-enable").disabled = true;
+  try {
+    msg.textContent = "Asking for permission…";
+    const perm = await Notification.requestPermission();
+    if (perm !== "granted") throw new Error("Notifications are off. Turn them on in Settings > Notifications > Approve.");
+    const reg = await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: unb64u(CONFIG.vapidPublicKey) });
+    // The signing key lives only on this phone: the private half can't be exported, even by this page.
+    const kp = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]);
+    const pub = await crypto.subtle.exportKey("raw", kp.publicKey);
+    await kvSet("keypair", kp);
+    await kvSet("pub", b64u(pub));
+    await kvSet("endpoint", sub.endpoint);
+    await kvDel("paired");
+    const code = await pairCode(pub);
+    await kvSet("code", code);
+    await post({ t: "pair", pub: b64u(pub), sub: sub.toJSON(), ua: navigator.userAgent.slice(0, 120) });
+    render();
+  } catch (e) {
+    msg.textContent = e.message || String(e);
+    $("b-enable").disabled = false;
+  }
+}
+
+async function sign(text) {
+  const kp = await kvGet("keypair");
+  return b64u(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, kp.privateKey, enc.encode(text)));
+}
+
+async function answer(key, action) {
+  const r = await reqGet(key);
+  if (!r || r.status !== "pending") return;
+  const ts = Math.floor(Date.now() / 1000);
+  const text = ["claude-allow/v1", action, r.id, r.rule, ts].join("\n");
+  r.status = "sending"; await reqPut(r); render();
+  try {
+    await post({ t: "ans", action, id: r.id, rule: r.rule, ts, sig: await sign(text) });
+    r.status = "sent"; r.action = action;
+  } catch (e) {
+    r.status = "pending"; r.error = "Couldn't send: " + (e.message || e) + ". Try again.";
+  }
+  await reqPut(r); render();
+}
+
+// If the browser rotated the push subscription, tell the Mac (signed, so nobody else can redirect pushes).
+async function syncSubscription() {
+  if (!(await kvGet("paired"))) return;
+  const reg = await navigator.serviceWorker.ready;
+  const sub = await reg.pushManager.getSubscription();
+  if (!sub || sub.endpoint === (await kvGet("endpoint"))) return;
+  const ts = Math.floor(Date.now() / 1000);
+  const sj = sub.toJSON();
+  await post({ t: "sub", sub: sj, ts, sig: await sign(["claude-allow/v1", "sub", sj.endpoint, ts].join("\n")) });
+  await kvSet("endpoint", sub.endpoint);
+}
+
+function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
+
+async function render() {
+  if (isIOS && !standalone) return show("install");
+  if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+    show("setup"); $("b-enable").disabled = true;
+    $("setup-msg").textContent = "This browser can't receive push notifications. Update iOS to 16.4 or later.";
+    return;
+  }
+  const kp = await kvGet("keypair");
+  const paired = await kvGet("paired");
+  $("foot").innerHTML = kp ? '<a href="#" id="repair">Pair again</a>' : "";
+  if ($("repair")) $("repair").onclick = async (e) => { e.preventDefault(); if (confirm("Pair this phone again?")) { await kvDel("keypair"); await kvDel("paired"); render(); } };
+  if (!kp) return show("setup");
+  if (!paired) { show("pair"); $("pair-code").textContent = await kvGet("code"); return; }
+  show("main");
+  syncSubscription().catch(() => {});
+  const week = Date.now() - 7 * 864e5;
+  let all = await reqAll();
+  for (const r of all) if (r.at < week) await reqDel(r.key);
+  all = all.filter((r) => r.at >= week).sort((a, b) => (a.status === "done") - (b.status === "done") || b.at - a.at);
+  const focus = (location.hash.match(/k=([\w-]+)/) || [])[1];
+  const list = $("list");
+  if (!all.length) { list.innerHTML = '<div class="empty">Nothing waiting. You\'ll get a notification when Claude asks for something.</div>'; return; }
+  list.innerHTML = all.map((r) => {
+    const st = r.status === "done" ? r.label
+      : r.status === "sending" ? "Sending…"
+      : r.status === "sent" ? (r.action === "approve" ? "Approved, waiting for your Mac…" : "Rejected, waiting for your Mac…")
+      : "";
+    const btns = r.status === "pending"
+      ? `<div class="row"><button class="reject" data-k="${esc(r.key)}" data-a="reject">Reject</button><button class="approve" data-k="${esc(r.key)}" data-a="approve">Approve</button></div>` : "";
+    return `<div class="card ${r.status === "done" ? "done" : ""} ${r.key === focus ? "flash" : ""}">
+      <div class="rule">${esc(r.rule)}</div>
+      ${r.reason ? `<div class="meta">Why: ${esc(r.reason)}</div>` : ""}
+      ${r.from ? `<div class="meta">From: ${esc(r.from)}</div>` : ""}
+      ${btns}${st ? `<div class="status">${esc(st)}</div>` : ""}${r.error ? `<div class="meta">${esc(r.error)}</div>` : ""}
+    </div>`;
+  }).join("");
+  list.querySelectorAll("button[data-k]").forEach((b) => (b.onclick = () => { b.disabled = true; answer(b.dataset.k, b.dataset.a); }));
+}
+
+$("b-enable").onclick = enable;
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("sw.js");
+  navigator.serviceWorker.addEventListener("message", () => render());
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) render(); });
+window.addEventListener("hashchange", render);
+render();
+</script>
+</body>
+</html>
